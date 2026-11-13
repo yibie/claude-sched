@@ -20,6 +20,8 @@ type Job = {
   once?: boolean
 }
 
+const NL_TIMEOUT_MS = 30_000
+
 const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
 
 const KEY = 'jobs'
@@ -178,9 +180,16 @@ export const register: Register = on => {
           prompt: buildNlPrompt(body, formatLocal(now, off), WEEKDAYS[local.getUTCDay()] ?? ''),
           maxTokens: 300,
           effort: 'low',
+          timeoutMs: NL_TIMEOUT_MS,
         })
         if (!reply.isAnswered) {
-          return { text: `Could not read the schedule (model call failed: ${reply.reason}). Use a cron expression instead.\n\n${HELP}` }
+          // `aborted` is a timeout or an interruption (Esc, or the plugin
+          // reloading mid-call), not a bad schedule: nothing was added.
+          const why =
+            reply.reason === 'aborted'
+              ? `the time phrase was not read: interrupted or no reply within ${NL_TIMEOUT_MS / 1000}s. Nothing was added; run the same command again`
+              : `the model call failed (${reply.reason}). Nothing was added; run it again, or give a cron expression`
+          return { text: `Could not add the job: ${why}.\n\n${HELP}` }
         }
         const parsed = interpretReply(reply.text, body)
         if (!parsed.ok) return { text: `Could not read the schedule: ${parsed.error}.\n\n${HELP}` }
