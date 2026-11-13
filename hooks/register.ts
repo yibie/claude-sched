@@ -1,5 +1,6 @@
 import type { Register } from 'claude-code'
 import { formatLocal, lastMatch, nextMatch, parseCron, parseOffset } from './cron.ts'
+import { buildNlPrompt, interpretReply, leadingCron, NL_SYSTEM } from './natural.ts'
 
 // Scheduled prompts, kept in the plugin store so they outlive the session.
 // A job belongs to the directory it was added in and fires only in an
@@ -15,7 +16,11 @@ type Job = {
   lastFired?: number
   paused?: boolean
   catchUp: boolean
+  /** Fire one time, then remove the job. */
+  once?: boolean
 }
+
+const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
 
 const KEY = 'jobs'
 const MINUTE = 60_000
@@ -23,7 +28,9 @@ const ON_TIME_MS = 2 * MINUTE
 
 const HELP = [
   'Usage:',
-  '  /sched add [--no-catchup] "<m h dom mon dow>" <prompt>   add a job for this directory',
+  '  /sched add [--no-catchup] <when> <prompt>                 add a job for this directory',
+  '      <when> is plain language ("every weekday at 9am", "tomorrow 3pm", "每天 9:13")',
+  '      or a cron expression ("13 9 * * *")',
   '  /sched list                                             jobs for this directory',
   '  /sched list all                                         jobs for every directory',
   '  /sched run <id>                                         fire a job now',
@@ -33,13 +40,6 @@ const HELP = [
 
 function newId(): string {
   return Math.random().toString(36).slice(2, 8)
-}
-
-function splitAdd(rest: string): { cron: string; prompt: string } {
-  const quoted = /^(["'])(.+?)\1\s+([\s\S]+)$/.exec(rest)
-  if (quoted) return { cron: quoted[2] ?? '', prompt: (quoted[3] ?? '').trim() }
-  const tokens = rest.split(/\s+/)
-  return { cron: tokens.slice(0, 5).join(' '), prompt: tokens.slice(5).join(' ').trim() }
 }
 
 export const register: Register = on => {
@@ -103,7 +103,7 @@ export const register: Register = on => {
           const mine = fresh.find(j => j.id === job.id)
           if (!mine || slot <= (mine.lastFired ?? mine.createdAt)) continue
           mine.lastFired = slot
-          await save(fresh)
+          await save(mine.once ? fresh.filter(j => j !== mine) : fresh)
 
           const late = now - slot > ON_TIME_MS
           if (late && !job.catchUp) continue
@@ -145,7 +145,9 @@ export const register: Register = on => {
         next = at === undefined ? 'never' : formatLocal(at, off)
       } catch {}
       const last = j.lastFired ? formatLocal(j.lastFired, off) : '-'
-      const flags = [j.paused ? 'paused' : '', j.catchUp ? '' : 'no-catchup'].filter(Boolean).join(',')
+      const flags = [j.paused ? 'paused' : '', j.catchUp ? '' : 'no-catchup', j.once ? 'once' : '']
+        .filter(Boolean)
+        .join(',')
       return `${j.id}  "${j.cron}"  next ${next}  last ${last}${flags ? `  [${flags}]` : ''}\n    ${j.cwd}\n    ${j.prompt.length > 120 ? j.prompt.slice(0, 117) + '...' : j.prompt}`
     }
     const find = (id: string | undefined) => jobs.find(j => j.id === id)
@@ -158,16 +160,44 @@ export const register: Register = on => {
           catchUp = false
           body = body.slice('--no-catchup'.length).trim()
         }
-        const { cron, prompt } = splitAdd(body)
-        try {
-          parseCron(cron)
-        } catch (err) {
-          return { text: `${(err as Error).message}\n\n${HELP}` }
+        if (!body) return { text: HELP }
+
+        const direct = leadingCron(body)
+        if (direct) {
+          if (!direct.prompt) return { text: `Missing prompt.\n\n${HELP}` }
+          const job: Job = { id: newId(), cron: direct.cron, prompt: direct.prompt, cwd, createdAt: now, catchUp }
+          await $.store.set(KEY, [...jobs, job])
+          return { text: `Added:\n${describe(job)}` }
         }
-        if (!prompt) return { text: `Missing prompt.\n\n${HELP}` }
-        const job: Job = { id: newId(), cron, prompt, cwd, createdAt: now, catchUp }
+
+        // Not a cron expression: let a small model read the time phrase.
+        const local = new Date(now + off * MINUTE)
+        const reply = await $.model.complete({
+          model: 'haiku',
+          system: NL_SYSTEM,
+          prompt: buildNlPrompt(body, formatLocal(now, off), WEEKDAYS[local.getUTCDay()] ?? ''),
+          maxTokens: 300,
+          effort: 'low',
+        })
+        if (!reply.isAnswered) {
+          return { text: `Could not read the schedule (model call failed: ${reply.reason}). Use a cron expression instead.\n\n${HELP}` }
+        }
+        const parsed = interpretReply(reply.text, body)
+        if (!parsed.ok) return { text: `Could not read the schedule: ${parsed.error}.\n\n${HELP}` }
+
+        const job: Job = {
+          id: newId(),
+          cron: parsed.cron,
+          prompt: parsed.prompt,
+          cwd,
+          createdAt: now,
+          catchUp,
+          ...(parsed.once ? { once: true } : {}),
+        }
         await $.store.set(KEY, [...jobs, job])
-        return { text: `Added:\n${describe(job)}` }
+        return {
+          text: `Read "${parsed.schedule}" as ${parsed.summary || parsed.cron} (cron "${parsed.cron}"${parsed.once ? ', once' : ''}).\nAdded:\n${describe(job)}\nWrong? /sched rm ${job.id} and add it again.`,
+        }
       }
       case 'list': {
         const all = restParts[0] === 'all'
