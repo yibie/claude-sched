@@ -1,0 +1,1 @@
+{ "name": "sched", "version": "0.1.0", "description": "Scheduled prompts that persist across sessions and fire in the directory they were added in" }
